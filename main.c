@@ -15,45 +15,50 @@
 
 //기타 정의
 #define SERVER_INFO "ERICA proxy (on Ubuntu)"
-#define MAX_THREAD 4
+#define MAX_THREAD 99
+#define MAX_INDIVIDUAL_CACHE_SIZE 524288
+#define MAX_AMOUNT_CACHE_SIZE 5242880
+#define BUFFER_MARGIN 10240
 /* 세부 사항
  * (1) 일부 통신 에러시 404 페이지를 임의로 전송합니다. (ip 값을 받아올 수 없거나, 암호화 통신을 요구하는 경우)
  * (2) 캐시의 url 의 크기가 512로 제한됩니다. 캐시는 url로만 판단합니다.
  * (3) POST와 피라미터를 전송하는 GET의 경우에는 캐시하지 않습니다. (외부 서버와 통신이 필수이기 때문에.)
  * (4) 유저가 원하는 경우에도 캐시를 하지 않습니다.
  * (5) 캐시는 양쪽 연결 배열로 구현되었습니다. (변수가 이용됩니다.)
- *
+ * (6) 혹시 모를 에러를 예방하기 위해 약간의 마진이 사용되었습니다.
 /* 어려웠던 점
  * (1) SSL 인증서 통신으로 인해 속도가 저하
  * (2) url 버퍼의 오버플로우로 인한 오류 (url 크기가 de fatto로 2K까지라 하는데, 여기서는 512만 저장)
- * (3) 멀티 쓰레드
+ * (3) 멀티 쓰레드 : 값 복사시 락을 걸어주지 않아서 임의로 걸었습니다.
  * (4) 포인터로 저장한 문자열은 크기를 바로 알 수 없는 점. 그래서 좀 저장해 놓은 게 바로 오지를 않았습니다.
  * (5) 캐시 저장 버퍼의 용량 계산을 실수로 잘 못해서 버퍼 오버플로우가 발생해서 잡는 데 약간 시간을 소모했습니다.
- *
 */
+
 //구조체 선언
 struct arg_for_thread {
     //pthread를 위한 매개 변수 전달용 구조체를 선언합니다.
     int accepted_sockfd;
     int client_int_ip;
 };
+
 //더블 연결 리스트
 typedef struct cache_node {
-    char url[524]; //혹시 모를 에러를 대비해서 살짝 버퍼를 높게 잡음.
-    char *cache_buffer; //캐시의 메모리
-    int size;
+    char url[524]; //url에 512까지 저장되나 12는 마진으로 주었습니다.
+    char *cache_buffer; //캐시의 내용이 저장되는 버퍼
+    int size; //캐시의 사이즈
     struct cache_node *next;
     struct cache_node *pre;
 } CACHE;
 
 //전역 변수
-static bool do_while = true;
-static bool thread_lock = true; //쓰레드 관련 블록하려고했는데 필요한건지....
-static int thread_num = 0; //사용 중인 스레드의 개수를 관리함
-static int cache_size = 0; //캐시의 총 사이즈
-//캐시 관리를 위한 노드
-static CACHE *cache_head = NULL;
-static CACHE *cache_tail = NULL;
+static bool do_while = true; //while문 이하를 true 또는 1로 해도 상관 없지만, IDE에서 색칠해 줘서 추가한 변수
+static bool thread_lock = true; //쓰레드에 값 전송시 올바르지 않은 값 전송 방지를 위한 록
+static int thread_num = 0; //현재 사용중인 쓰레드의 개수 (오류를 미연에 방지할 목적)
+static int cache_size = 0; //현재 저장된 캐시의 총 사이즈.
+static CACHE *cache_head = NULL; //캐시의 머리입니다.
+static CACHE *cache_tail = NULL; //캐시의 꼬리입니다.
+static FILE *fp;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 bool is_cacheable(char *header, char *url) {
     //헤더를 보고 해당 페이지를 캐시 해야하는지 알려준다.
@@ -131,12 +136,12 @@ int del_cache(CACHE **pp_tail) {
 
 //원형 선언
 char *get_server_time();
-char *int_to_ip(int number);
+unsigned char *int_to_ip(int number);
 void error(char *msg);
 void proxy_log(int int_ip_address, char *url, int file_size);
 void get_domain_info(char buf[], char **domain_info);
 void become_http1(char header[]);
-void send_404(int accepted_sockfd);
+void send_404(int accepted_sockfd, int external_sockfd);
 
 void cache_store(char *url, char *content, int size){
     //단일 용량이 512KB 미만인 캐시 파일을 저장
@@ -149,7 +154,7 @@ void cache_store(char *url, char *content, int size){
     cache_size = cache_size + size;
 
     //총 용량을 확인하여 5MB를 넘는다면 노드를 삭제한다.
-    while (cache_size > 5242880) {
+    while (cache_size > MAX_AMOUNT_CACHE_SIZE) {
         printf("\n용량을 초과했기 때문에, 캐시를 지웠습니다.\n");
         cache_size = cache_size - del_cache(&cache_tail);
     }
@@ -157,10 +162,9 @@ void cache_store(char *url, char *content, int size){
 
 char *cache_access(CACHE **cache_head, CACHE **cache_tail, char *url, int *size){
     //포인터와 변수를 하나 리턴해야 하는데 어쩔 수 없이, 맨 마지막에 int 형 포인터를 받아서 size를 리턴합니다. (주의)
-    //캐시를 억세스한다.
-    //억세스시 순서를 제일 최근으로 바꾼다.
+    //캐시를 억세스한다. 억세스시 순서를 제일 최근으로 바꾼다. (LRU)
     //실패시 NULL을 리턴한다.
-    //캐시의 파일의 번호를 리턴함.
+    //캐시 버퍼의 포인터를 리턴해 준다.
     CACHE *p;
 
     p = *cache_head;
@@ -191,8 +195,6 @@ char *cache_access(CACHE **cache_head, CACHE **cache_tail, char *url, int *size)
 }
 
 void *proxy_do(void *arg) {
-    //새로운 스레드를 만들 수 없도록 블락한다.
-    //thread_lock = false;
     //구조체를 arg 포인터로 받아서 변환한다.
     //connection_info->accepted_sockfd, client_int_ip를 사용가능
     struct arg_for_thread *connection_info = (struct arg_for_thread *)arg;
@@ -207,36 +209,41 @@ void *proxy_do(void *arg) {
     int file_size = 0;
 
     char* domain_info[2]; //도메인 관련 정보를 기록하는 배열
-
     char* cache_content;
+
     //새로운 스레드를 만들 수 있도록 블락을 푼다.
-    //thread_lock = true;
+    thread_lock = true;
+
     memset(&hints, 0,sizeof(hints));
     hints.ai_family=AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
-    //사용자에게 헤더를 받아옵니다. 헤더의 합이 8192바이트를 넘지 않는다고 가정합니다.
+    //사용자에게 헤더를 받아옵니다. 헤더의 합이 4096바이트를 넘지 않는다고 가정합니다.
     byte_count = read(accepted_sockfd, buf, sizeof(buf) - 1);
+
     if(byte_count < 0) {
         printf("\n헤더 요청을 받을 수 없었습니다.\n");
-        send_404(accepted_sockfd);
+        send_404(accepted_sockfd, -1);
         return 0;
     }
+
     if (!(strstr(buf, "GET") != NULL || strstr(buf, "POST") != NULL)) {
         //GET 또는 POST가 아닌 경우
         printf("\n처리할 수 없는 요청을 받았습니다.\n");
-        send_404(accepted_sockfd);
+        send_404(accepted_sockfd, -1);
         return 0;
     }
 
     get_domain_info(buf, domain_info); //헤더로부터 도메인 정보를 추출
 
-    int cache_size = 0;
+    int cache_size = 0; //현재 요청의 파일 사이즈를 측정
 
+    pthread_mutex_lock(&mutex); //노드가 꼬일 염려가 있으므로 생성을 막습니다.
     cache_content = cache_access(&cache_head, &cache_tail, domain_info[1], &cache_size);
+    pthread_mutex_unlock(&mutex);
 
     if (cache_content == NULL) { //캐시에 없는 내용입니다.
-        char* cache_buffer = (char *)malloc(sizeof(char) * 524288); //캐시 저장을 위해 512KB의 버퍼를 선언
+        char* cache_buffer = (char *)malloc(sizeof(char) * (MAX_INDIVIDUAL_CACHE_SIZE + BUFFER_MARGIN)); //캐시 저장을 위해 (512KB+마진)의 버퍼를 선언
         memset(cache_buffer, 0, sizeof(cache_buffer));
         char* cache_buffer_pointer = cache_buffer;
         bool can_cached = is_cacheable(buf, domain_info[1]);
@@ -244,22 +251,25 @@ void *proxy_do(void *arg) {
         if(getaddrinfo(domain_info[0],"80", &hints, &res) != 0) {
             //추출한 도메인 정보로부터 서버의 ip를 받아 옵니다. 에러시 종료
             printf("\n외부 서버의 ip를 받아오지 못 했습니다.\n");
-            send_404(accepted_sockfd);
+            send_404(accepted_sockfd, -1);
             return 0;
         }
+
         external_sockfd = socket(res->ai_family,res->ai_socktype,res->ai_protocol); //외부 서버에 연결합니다.
+
         if(connect(external_sockfd,res->ai_addr,res->ai_addrlen) != 0) {
             printf("\n외부 서버와의 연결에 실패했습니다.\n");
-            send_404(accepted_sockfd);
+            send_404(accepted_sockfd, -1);
             return 0;
         }
 
         become_http1(buf); //사용자 헤더의 요청을 http1.0, close 상태로 강제 변환합니다.
         write(external_sockfd, buf, sizeof(char) * byte_count); //헤더를 외부 서버로 전송합니다.
         printf("\n%s\n", buf);
+
         if (strstr(buf, "application/ocsp-request") != NULL) {
             //ssl 인증서 요청하는데 트래픽이 https로 들어가서 멈춥니다.... 방지...
-            send_404(accepted_sockfd);
+            send_404(accepted_sockfd, external_sockfd);
             return 0;
         }
 
@@ -277,30 +287,22 @@ void *proxy_do(void *arg) {
 
         //헤더의 전송을 끝낸 후에 서버로부터 응답을 받습니다.
         byte_count = read(external_sockfd, buf, sizeof(buf) - 1);
-        file_size = file_size + (int)byte_count - 1;
-        buf[byte_count] = 0;
-        become_http1(buf);
-        printf("\n%s\n", buf);
-        write(accepted_sockfd, buf, sizeof(char) * byte_count);
-        //캐시 기록
-        memcpy(cache_buffer, buf, sizeof(char) * (byte_count));
-        cache_buffer_pointer += byte_count;
-
+        if(byte_count > 0) become_http1(buf);
         while (byte_count > 0) {
-            byte_count = read(external_sockfd, buf, sizeof(buf) - 1);
             file_size = file_size + (int)byte_count;
             buf[byte_count] = 0;
             printf("\n%s\n", buf);
             if (write(accepted_sockfd, buf, sizeof(char) * byte_count) < 0) {
                 break;
             };
-            if (file_size > 520000 && can_cached) {
+            if (file_size > (MAX_INDIVIDUAL_CACHE_SIZE - 4096) && can_cached) {
                 printf("\n캐시에 저장할 수 없는 크기의 데이터입니다.\n");
                 can_cached = false;
-            } else {
+            } else if(can_cached){
                 memcpy(cache_buffer_pointer, buf, sizeof(char) * (byte_count));
                 cache_buffer_pointer += byte_count;
             }
+            byte_count = read(external_sockfd, buf, sizeof(buf) - 1);
         }
 
         file_size++;//널 문자
@@ -308,14 +310,19 @@ void *proxy_do(void *arg) {
         char **url = &domain_info[1];
 
         if (can_cached) {
+            //while(!cache_make_lock) {} //캐시 생성시 락을 겁니다.
+            //cache_make_lock = false;
+            pthread_mutex_lock(&mutex);
             cache_store(*url, cache_buffer, file_size);
+            pthread_mutex_unlock(&mutex);
+            //cache_make_lock = true;
         }
     } else {//캐시에 있는 내용입니다.
         become_http1(buf); //사용자 헤더의 요청을 http1.0, close 상태로 강제 변환합니다.
         printf("\n%s\n", buf);
         if (strstr(buf, "application/ocsp-request") != NULL) {
             //ssl 인증서 요청하는데 트래픽이 https로 들어가서 멈춥니다.... 방지...
-            send_404(accepted_sockfd);
+            send_404(accepted_sockfd, external_sockfd);
             return 0;
         }
 
@@ -337,13 +344,17 @@ void *proxy_do(void *arg) {
     }
 
     //전송이 종료되어 소켓을 닫습니다.
-    if (close(accepted_sockfd) == 0) printf("\n현재 전송이 끝나 소켓을 닫았습니다.\n");
+    if (close(external_sockfd) == 0) printf("\n현재 전송이 끝나 외부 방향 소켓을 닫았습니다.\n");
+    if (close(accepted_sockfd) == 0) printf("\n현재 전송이 끝나 내부 방향 소켓을 닫았습니다.\n");
 
     proxy_log(client_int_ip, domain_info[1], file_size);
 
     //스레드의 종료
-    printf("\n스레드가 종료되었습니다.\n");
+    pthread_mutex_lock(&mutex);
     thread_num--;
+    pthread_mutex_unlock(&mutex);
+
+    printf("\n스레드가 종료되었습니다. 남은 쓰레드: %d\n", (MAX_THREAD - (thread_num)));
 }
 
 int main(int argc, char *argv[]) {
@@ -357,6 +368,8 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "\n실행을 위해 포트 번호를 지정하시기 바랍니다.\n");
         exit(1);
     }
+    //파일 포인터를 엽니다.
+    fp = fopen("./log.txt", "a");
 
     //시그날을 무시합니다. broken pipe시 무시합니다.
     signal(SIGPIPE, SIG_IGN);
@@ -387,19 +400,23 @@ int main(int argc, char *argv[]) {
     //do_while을 나중에 시그날로 처리해야함.
     while(do_while) {
         if (thread_num < MAX_THREAD && thread_lock) {
+            thread_lock = false;
             connection_info.accepted_sockfd = accept(listen_sockfd, (struct sockaddr *) &cli_addr, &clilen);
             if (connection_info.accepted_sockfd < 0) error("\n클라이언트의 요청이 수락되지 않았습니다.\n");
             connection_info.client_int_ip = cli_addr.sin_addr.s_addr;
-            //if (pthread_create(&thread_t, NULL, proxy_do, (void *)&connection_info) < 0) {
-            //    printf("\n사용자와의 통신을 위한 스레드가 정상적으로 수립되지 않았습니다.\n");
-            //} else {
-            //    printf("\n스레드가 수립되었습니다. 남은 쓰레드: %d\n", (MAX_THREAD - (thread_num + 1)));
-            //    thread_num++;
-            //}
-            proxy_do((void *)&connection_info);
-            //thread_num++;
+            if (pthread_create(&thread_t, NULL, proxy_do, (void *)&connection_info) < 0) {
+                printf("\n사용자와의 통신을 위한 스레드가 정상적으로 수립되지 않았습니다.\n");
+                thread_lock = true;
+            } else {
+                pthread_mutex_lock(&mutex);
+                thread_num++;
+                pthread_mutex_unlock(&mutex);
+                printf("\n스레드가 수립되었습니다. 남은 쓰레드: %d\n", (MAX_THREAD - (thread_num)));
+            }
         }
     }
+    //파일 포인터를 닫습니다.
+    fclose(fp);
 }
 
 char *get_server_time() {
@@ -421,14 +438,14 @@ char *get_server_time() {
     return time;
 }
 
-char *int_to_ip(int number) {
+unsigned char *int_to_ip(int number) {
     //int형 정수로 받아오는 ip를 통상적인 255.255.255.255 형태로 변환시킵니다.
-    char ip[4];
-    char *ptr = malloc(sizeof(char) * 16);
-    ip[0] = (char) number;
-    ip[1] = (char) (number >> 8);
-    ip[2] = (char) (number >> 16);
-    ip[3] = (char) (number >> 24);
+    unsigned char ip[4];
+    unsigned char *ptr = malloc(sizeof(char) * 16);
+    ip[0] = (unsigned char) number;
+    ip[1] = (unsigned char) (number >> 8);
+    ip[2] = (unsigned char) (number >> 16);
+    ip[3] = (unsigned char) (number >> 24);
     sprintf(ptr, "%d.%d.%d.%d", ip[0], ip[1],ip[2],ip[3]);
     return ptr;
 }
@@ -442,9 +459,8 @@ void error(char *msg) {
 void proxy_log(int int_ip_address, char *url, int file_size){
     //프록시 로그 파일
     //eg. Sun 20 May 2018 02:51:02 EST: 166.104.231.100 http://hanyang.ac.kr/ 3111
-    FILE *fp = fopen("./log.txt", "a");
     char* time = get_server_time();
-    char* ip = int_to_ip(int_ip_address);
+    unsigned char* ip = int_to_ip(int_ip_address);
 
     fprintf(fp, "%s %s %s %d\n", time, ip, url, file_size);
 
@@ -452,8 +468,6 @@ void proxy_log(int int_ip_address, char *url, int file_size){
     time = NULL;
     free(ip);
     ip = NULL;
-
-    fclose(fp);
 }
 
 void get_domain_info(char buf[], char **domain_info){
@@ -497,11 +511,17 @@ void become_http1(char header[]) {
             temp2 = strstr(temp1, "\r\n");
             sprintf(temp1, "Connection: close%s", temp2);
         }
+        temp1 = strstr(header, "Keep-Alive : ");
+        if (temp1 > 0) {
+            temp2 = strstr(temp1, "\r\n");
+            sprintf(temp1, "%s", temp2);
+        }
     }
 }
 
-void send_404(int accepted_sockfd) {
+void send_404(int accepted_sockfd, int external_sockfd) {
     //특별한 경우 강제로 404 페이지를 전송합니다.
+    //ip에 연결이 불가능하거나, https 연결인 경우 등
     char sagongsa[] = "No page";
     char http_header[256] = {0, };
 
@@ -516,7 +536,13 @@ void send_404(int accepted_sockfd) {
             , get_server_time(), SERVER_INFO, "text/html; charset=utf-8", sizeof(sagongsa), sagongsa);
 
     write(accepted_sockfd, http_header, strlen(http_header));
+    pthread_mutex_lock(&mutex);
     thread_num--;
+    pthread_mutex_unlock(&mutex);
     printf("\n오류로 인해 임의로 404 페이지를 전송했습니다.\n");
-    if (close(accepted_sockfd) == 0) printf("\n현재 전송이 끝나 소켓을 닫았습니다.\n");
+    if (external_sockfd != -1) {
+        if (close(external_sockfd) == 0) printf("\n현재 전송이 끝나 외부 방향 소켓을 닫았습니다.\n");
+    }
+    if (close(accepted_sockfd) == 0) printf("\n현재 전송이 끝나 내부 방향 소켓을 닫았습니다.\n");
+    printf("\n남은 쓰레드: %d\n", (MAX_THREAD - (thread_num)));
 }
